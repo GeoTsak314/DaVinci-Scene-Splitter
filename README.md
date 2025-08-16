@@ -176,5 +176,5 @@ You'll see a menu:
 
 ------------------------------------------------------------------------
 
-✨ Done! You now have a fast, automated scene-splitting workflow for
+✨ Now you have a fast, automated scene-splitting workflow for
 DaVinci Resolve with no intermediate encoding.
