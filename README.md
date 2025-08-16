@@ -30,7 +30,7 @@ final video inside Resolve.
 
 ## Requirements
 
--   Windows 10\
+-   Windows 10 or higher\
 
 -   Python 3.9+\
 
