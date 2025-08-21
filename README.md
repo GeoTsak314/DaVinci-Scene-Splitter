@@ -1,4 +1,4 @@
-# Z-3 Scene Splitter for DaVinci Resolve v1.5 (by George Tsakalos)
+# Scene Splitter for DaVinci Resolve v1.5 (by George Tsakalos)
 
 This Python tool automates **scene detection** on large video files and
 builds a **pre-sliced DaVinci Resolve timeline** with frame-accurate
