@@ -1,4 +1,4 @@
-# Z-3 Scene Splitter v1.2 (by George Tsakalos)
+# Z-3 Scene Splitter v1.5 (by George Tsakalos)
 
 
 import os
@@ -8,19 +8,16 @@ import json
 import csv
 from pathlib import Path
 
-# ========== CONFIG YOU CAN EDIT ==========
-# Your Resolve executable path (given by you):
-RESOLVE_EXE = r"C:\DaVinci\Resolve.exe"
+# ========== CONFIG CORE PARAMETERS ==========
+# Your Resolve executable path (this is the default install path, change if different)
+# & be careful, because from version 20 and, the necessary scripting / Developer directory
+# is now hidden in C:\ProgramData\Blackmagic Design\DaVinci Resolve\Support\Developer\Scripting\):
+RESOLVE_EXE = r"C:\Program Files\Blackmagic Design\DaVinci Resolve\Resolve.exe"
 
-# Additional Resolve scripting search paths:
-# If the import fails, we’ll try these + some common defaults.
 RESOLVE_SCRIPT_HINTS = [
-    r"C:\DaVinci\Developer\Scripting\\",
-    r"C:\DaVinci\Developer\Scripting\Examples\\",
-    r"C:\DaVinci\fuscript\\",
-    r"C:\Program Files\Blackmagic Design\DaVinci Resolve\Developer\Scripting\\",
-    r"C:\Program Files\Blackmagic Design\DaVinci Resolve\Developer\Scripting\Examples\\",
-    r"C:\Program Files\Blackmagic Design\DaVinci Resolve\fuscript\\",
+    r"C:\ProgramData\Blackmagic Design\DaVinci Resolve\Support\Developer\Scripting\\",
+    r"C:\ProgramData\Blackmagic Design\DaVinci Resolve\Support\Developer\Scripting\Examples\\",
+    r"C:\Program Files\Blackmagic Design\DaVinci Resolve\\"
 ]
 # ========================================
 
@@ -201,8 +198,7 @@ def bootstrap_resolve_paths():
             break
 
 def ensure_resolve_running():
-    # Optional: try to launch Resolve if not already open
-    # You can comment this out if you always run Resolve yourself first.
+    # try to launch Resolve if not already open
     try:
         subprocess.Popen([RESOLVE_EXE], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
@@ -342,6 +338,7 @@ def main():
     print("=== Scene Splitter ===")
     print("1) Detect scenes -> CSV + EDL + frames list")
     print("2) Apply cuts in DaVinci Resolve timeline (frame-accurate)")
+    print("3) Build final file (HYBRID: stream-copy when possible, re-encode only where needed)")
     choice = input("Choose 1 or 2: ").strip()
 
     if choice == "1":
@@ -358,8 +355,223 @@ def main():
         cpath = input("Path to cuts file (CSV or TXT from option 1): ").strip('"').strip()
         print("Tip: make sure Resolve is open (or I’ll try to launch it).")
         option2_apply_to_resolve(vpath, cpath)
+    elif choice == "3":
+        option3_prompt()
     else:
         print("Invalid choice.")
 
 if __name__ == "__main__":
     main()
+
+
+# ---------------- VIDEO HYBRID BUILD (Option 3) ----------------
+import tempfile
+import shutil
+
+def parse_timecode_to_seconds(tc, fps):
+    # expects HH:MM:SS:FF
+    h, m, s, f = [int(x) for x in tc.split(":")]
+    return h*3600 + m*60 + s + f/float(fps)
+
+EDL_LINE = re.compile(
+    r"^\s*(\d+)\s+(\S+)\s+V\s+C\s+(\d{2}:\d{2}:\d{2}:\d{2})\s+(\d{2}:\d{2}:\d{2}:\d{2})\s+(\d{2}:\d{2}:\d{2}:\d{2})\s+(\d{2}:\d{2}:\d{2}:\d{2})"
+)
+
+def parse_edl_segments(edl_path, fps):
+    segs = []
+    with open(edl_path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            m = EDL_LINE.search(line)
+            if not m:
+                continue
+            src_in = m.group(3); src_out = m.group(4)
+            si = parse_timecode_to_seconds(src_in, fps)
+            so = parse_timecode_to_seconds(src_out, fps)
+            if so > si:
+                segs.append((si, so))
+    if not segs:
+        raise ValueError("No segments parsed from EDL.")
+    return segs
+
+def ffprobe_stream_props(path):
+    """Return dict with stream codec info and audio layout/rate."""
+    import json, subprocess
+    cmd = [
+        "ffprobe","-v","error",
+        "-select_streams","v:0","-show_entries","stream=codec_name,profile,level,pix_fmt,width,height,r_frame_rate",
+        "-select_streams","a:0","-show_entries","stream=codec_name,channels,channel_layout,sample_rate",
+        "-of","json", path
+    ]
+    out = subprocess.check_output(cmd, text=True)
+    data = json.loads(out)
+    v = None; a = None
+    for st in data.get("streams", []):
+        if st.get("codec_type") == "video" or "width" in st:
+            v = st
+        elif st.get("codec_type") == "audio" or "sample_rate" in st:
+            a = st
+    return v, a
+
+def ffprobe_keyframes(path):
+    """Return sorted list of keyframe times (seconds) for v:0."""
+    import subprocess, json, math
+    cmd = [
+        "ffprobe","-v","error","-select_streams","v:0",
+        "-show_frames","-show_entries","frame=key_frame,pkt_pts_time",
+        "-of","json", path
+    ]
+    out = subprocess.check_output(cmd, text=True)
+    data = json.loads(out)
+    kts = []
+    for fr in data.get("frames", []):
+        if str(fr.get("key_frame","0")) == "1":
+            t = fr.get("pkt_pts_time")
+            if t is not None:
+                try:
+                    kts.append(float(t))
+                except:
+                    pass
+    return sorted(kts)
+
+def nearest_keyframe_distance(t, keyframes):
+    # keyframes is sorted list
+    import bisect, math
+    i = bisect.bisect_left(keyframes, t)
+    best = float("inf")
+    if i < len(keyframes):
+        best = min(best, abs(keyframes[i] - t))
+    if i > 0:
+        best = min(best, abs(keyframes[i-1] - t))
+    return best
+
+def build_concat_listfile(paths):
+    tf = tempfile.NamedTemporaryFile(delete=False, suffix=".txt", mode="w", encoding="utf-8")
+    for p in paths:
+        tf.write(f"file '{p}'\n")
+    tf.flush()
+    return tf.name
+
+def run(cmd):
+    print(">>", " ".join(cmd))
+    subprocess.check_call(cmd)
+
+def extract_copy(input_video, start, dur, out_path):
+    # stream copy around keyframes
+    cmd = [
+        "ffmpeg","-y","-hide_banner","-nostats",
+        "-ss", f"{start:.6f}","-t", f"{dur:.6f}",
+        "-i", input_video, "-c","copy",
+        "-avoid_negative_ts","make_zero",
+        out_path
+    ]
+    run(cmd)
+
+def extract_encode(input_video, start, dur, out_path, vcodec, acodec, width=None, height=None, fps=None):
+    # precise re-encode
+    vf = []
+    if width and height:
+        vf.append(f"scale={width}:{height}:flags=bicubic")
+    vmap = []
+    cmd = [
+        "ffmpeg","-y","-hide_banner","-nostats",
+        "-ss", f"{start:.6f}","-t", f"{dur:.6f}",
+        "-i", input_video,
+        "-c:v", vcodec,
+        "-c:a", acodec
+    ]
+    if fps:
+        cmd += ["-r", f"{fps:.6f}"]
+    if vf:
+        cmd += ["-vf", ",".join(vf)]
+    cmd += [out_path]
+    run(cmd)
+
+def option3_hybrid_build(input_video, edl_path, container_ext):
+    if not has_cmd("ffprobe") or not has_cmd("ffmpeg"):
+        print("FFmpeg/ffprobe not found in PATH.")
+        return
+    if not os.path.isfile(input_video) or not os.path.isfile(edl_path):
+        print("Missing input video or EDL file.")
+        return
+
+    # Source props
+    num, den, fps, dur = ffprobe_fps(input_video)
+    vprops, aprops = ffprobe_stream_props(input_video)
+    width = vprops.get("width"); height = vprops.get("height")
+
+    # Target container & codecs (trying to match source video codec; audio standardized to AAC to ensure concat compatibility)
+    src_v = (vprops or {}).get("codec_name","")
+    if src_v in ("h264","hevc","mpeg4","vp9","prores","mpeg2video"):
+        target_vcodec = {"h264":"libx264","hevc":"libx265","mpeg4":"mpeg4","vp9":"libvpx-vp9","prores":"prores_ks","mpeg2video":"mpeg2video"}.get(src_v,"libx264")
+    else:
+        target_vcodec = "libx264"
+    target_acodec = "aac"
+
+    # Read segments from EDL
+    segments = parse_edl_segments(edl_path, fps)
+    if not segments:
+        print("No segments in EDL.")
+    keyframes = ffprobe_keyframes(input_video)
+    frame_tol = 0.5 / max(fps,1)  # within half a frame considered OK for copy
+
+    # Make temp dir
+    tmpdir = Path(tempfile.mkdtemp(prefix="hybrid_parts_"))
+    part_paths = []
+    try:
+        idx = 0
+        for (start, end) in segments:
+            dur_seg = max(0.0, end - start)
+            if dur_seg <= 0.0:
+                continue
+            # Decide copy vs encode based on both ends near keyframes
+            d1 = nearest_keyframe_distance(start, keyframes)
+            d2 = nearest_keyframe_distance(end, keyframes)
+            can_copy = (d1 <= frame_tol) and (d2 <= frame_tol)
+            # Output per-part as MKV to be container-agnostic during building
+            part = tmpdir / f"part_{idx:03d}.mkv"
+            if can_copy:
+                try:
+                    extract_copy(input_video, start, dur_seg, str(part))
+                    # Also need unified audio codec for concat; re-mux audio if not AAC
+                    # It quickly re-mux part to ensure audio is AAC without re-encoding video
+                    if aprops and aprops.get("codec_name","").lower() != "aac":
+                        remux = tmpdir / f"part_{idx:03d}_aac.mkv"
+                        run([
+                            "ffmpeg","-y","-hide_banner","-nostats",
+                            "-i", str(part),
+                            "-c:v","copy","-c:a","aac",
+                            str(remux)
+                        ])
+                        part = remux
+                except subprocess.CalledProcessError:
+                    # fallback to encode for problematic extracts
+                    extract_encode(input_video, start, dur_seg, str(part), target_vcodec, target_acodec, width, height, fps)
+            else:
+                extract_encode(input_video, start, dur_seg, str(part), target_vcodec, target_acodec, width, height, fps)
+            part_paths.append(str(part))
+            idx += 1
+
+        # Concat all parts
+        listfile = build_concat_listfile(part_paths)
+        out_base = str(Path(input_video).with_suffix("")) + "_EDITED"
+        out_path = out_base + container_ext
+        run([
+            "ffmpeg","-y","-hide_banner","-nostats",
+            "-f","concat","-safe","0","-i", listfile,
+            "-c","copy", out_path
+        ])
+        print(f"Done. Output: {out_path}")
+    finally:
+        # Keep temp dir for debugging
+        pass
+
+def option3_prompt():
+    vpath = input("Path to the original video: ").strip('"').strip()
+    edl = input("Path to Resolve export (EDL CMX3600): ").strip('"').strip()
+    print("\nOutput container?")
+    print("  1) MKV (default)")
+    print("  2) MP4")
+    print("  3) AVI")
+    fmt_choice = input("Select number [1]: ").strip() or "1"
+    ext = ".mkv" if fmt_choice == "1" else ".mp4" if fmt_choice == "2" else ".avi"
+    option3_hybrid_build(vpath, edl, ext)

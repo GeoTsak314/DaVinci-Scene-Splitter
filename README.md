@@ -1,4 +1,4 @@
-# Z-3 Scene Splitter for DaVinci Resolve v1.2 (by George Tsakalos)
+# Z-3 Scene Splitter for DaVinci Resolve v1.5 (by George Tsakalos)
 
 This Python tool automates **scene detection** on large video files and
 builds a **pre-sliced DaVinci Resolve timeline** with frame-accurate
@@ -16,6 +16,8 @@ final video inside Resolve.
     -   [PySceneDetect](https://pyscenedetect.readthedocs.io/)
         (OpenCV-based, recommended)
     -   or fallback to **FFmpeg scene detection** (fast, lightweight)
+    -   DaVinci Resolve has build-in detect mech, but available only
+        in the paid version (Studio).
 -   Outputs:
     -   `*_scenes.csv` -- list of cut times with seconds, timecodes, and
         frame numbers
@@ -30,7 +32,7 @@ final video inside Resolve.
 
 ## Requirements
 
--   Windows 10 or higher\
+-   Windows 10\
 
 -   Python 3.9+\
 
@@ -126,7 +128,7 @@ You'll see a menu:
 
 ## Notes
 
--   **Frame accuracy**:\
+-   **Frame accuracy (hybrid method = minimal loss & best speed)**:\
     Cuts are quantized to the nearest frame (from ffprobe FPS).
     Resolve's timeline guarantees frame-accurate editing.
 
@@ -175,6 +177,3 @@ You'll see a menu:
     -   Export the final video as usual.
 
 ------------------------------------------------------------------------
-
-✨ Now you have a fast, automated scene-splitting workflow for
-DaVinci Resolve with no intermediate encoding.
