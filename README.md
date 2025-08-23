@@ -10,8 +10,8 @@ Fast & frame-accurate editing workflows driven by a Resolve-free Python helper:
 
 ## Requirements
 
-- **Windows 10 or later**
-- **Python 3.9+**
+- **Windows 10 and later / Linux**
+- **Python 3.9 and above**
 - **FFmpeg & ffprobe** in `PATH`
   - For **GPU**: FFmpeg build with **CUDA/NVENC** (`h264_nvenc`, `-hwaccels` shows `cuda`).
   - For **VMAF** in Option 3: FFmpeg with **`libvmaf`** and a **VMAF JSON model** file (e.g. `vmaf_v0.6.1.json`).
